@@ -20,6 +20,7 @@ VPN Gate SSTP 节点检测流水线
 
 import base64
 import csv
+import hashlib
 import io
 import json
 import os
@@ -604,6 +605,33 @@ def build_sub_text(data):
     return "\n".join(lines) + "\n"
 
 
+def _edt_sub_token(domain, uuid):
+    """复刻 edgetunnel 的 MD5MD5: md5( md5(domain + UUID) 的十六进制 [7:27] )。"""
+    inner = hashlib.md5((domain + uuid).encode("utf-8")).hexdigest()[7:27]
+    return hashlib.md5(inner.encode("utf-8")).hexdigest()
+
+
+def build_edt_direct_sub_text(timeout=30):
+    """从 edgetunnel 后台订阅接口拉取直连节点, 只保留 host=EDT_DOMAIN 的一份,
+    生成独立 base64 订阅 (供 Quantumult X 等客户端单独导入, 与旧节点分开)。
+    失败时返回 None, 不影响主流程。"""
+    token = _edt_sub_token(EDT_DOMAIN, EDT_UUID)
+    url = f"https://{EDT_DOMAIN}/sub?token={token}"
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "vpngate-gate/1.0"})
+    resp.raise_for_status()
+    raw = resp.text.strip()
+    try:
+        decoded = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace")
+    except Exception:
+        decoded = raw
+    lines = [ln.strip() for ln in decoded.splitlines() if ln.strip()]
+    keep = [ln for ln in lines if f"host={EDT_DOMAIN}" in ln]
+    if not keep:
+        return None
+    body = "\n".join(keep) + "\n"
+    return base64.b64encode(body.encode("utf-8")).decode("ascii") + "\n"
+
+
 def write_outputs(data):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data_path = os.path.join(PUBLIC_DIR, "data.json")
@@ -636,7 +664,20 @@ def write_outputs(data):
     sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write(build_sub_text(data))
-    return data_path, html_path, chains_path, hosts_path, sub_path
+
+    # edgetunnel 直连节点独立订阅 (只含 host=EDT_DOMAIN, 供 Qx 单独导入, 与旧节点分开)
+    edt_path = None
+    try:
+        edt_text = build_edt_direct_sub_text()
+        if edt_text:
+            edt_path = os.path.join(PUBLIC_DIR, "sub-edt.txt")
+            with open(edt_path, "w", encoding="utf-8") as f:
+                f.write(edt_text)
+        else:
+            log("WEBSITE", f"sub-edt.txt: 后台未返回 host={EDT_DOMAIN} 的节点, 已跳过")
+    except Exception as exc:
+        log("WEBSITE", f"sub-edt.txt 生成失败(已跳过): {type(exc).__name__}: {exc}")
+    return data_path, html_path, chains_path, hosts_path, sub_path, edt_path
 
 
 # ---------------------------------------------------------------------------
@@ -688,12 +729,14 @@ def main():
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    data_path, html_path, chains_path, hosts_path, sub_path = write_outputs(data)
+    data_path, html_path, chains_path, hosts_path, sub_path, edt_path = write_outputs(data)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(sub_path, REPO_DIR)}")
+    if edt_path:
+        log("WEBSITE", f"生成 {os.path.relpath(edt_path, REPO_DIR)}")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
 
